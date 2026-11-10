@@ -38,7 +38,7 @@ type config struct {
 	GcloudAccount string `json:"gcloud_account"`
 	// KeepLocalText keeps message content in the local SQLite after it is pushed.
 	// Default false: text lives only in the Sheet; the DB keeps IDs/timestamps.
-	KeepLocalText bool `json:"keep_local_text"`
+	KeepLocalText bool   `json:"keep_local_text"`
 	GcloudBin     string `json:"gcloud_bin"`
 	IntervalHours int    `json:"interval_hours"`
 }
@@ -136,6 +136,11 @@ func cmdPair(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Printf("Found %d Google cookies. Starting pairing...\n", len(ck))
+	lock, err := syncLock()
+	if err != nil {
+		return fmt.Errorf("%w: stop the daemon first (launchctl bootout gui/$(id -u)/%s)", err, launchLabel())
+	}
+	defer lock.Close()
 	st, c, err := openAll(true)
 	if err != nil {
 		return err
@@ -153,7 +158,18 @@ func cmdPair(ctx context.Context, args []string) error {
 	}
 	_ = st.SetMeta("paired_at", time.Now().Format(time.RFC3339))
 	fmt.Println("Paired. Session saved.")
+	lock.Close()
+	if exec.Command("launchctl", "kickstart", "-k", fmt.Sprintf("gui/%d/%s", os.Getuid(), launchLabel())).Run() == nil {
+		fmt.Println("Restarted the background daemon.")
+	}
 	return nil
+}
+
+func launchLabel() string {
+	if l := os.Getenv("SMSBRIDGE_LABEL"); l != "" {
+		return l
+	}
+	return "com.smsbridge.daemon"
 }
 
 // syncLock ensures only one process uses the Google Messages session at a time.
@@ -217,6 +233,11 @@ func doPush(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	lock, err := syncLock()
+	if err != nil {
+		return 0, fmt.Errorf("%w (the daemon pushes on its own)", err)
+	}
+	defer lock.Close()
 	st, err := store.Open(filepath.Join(dataDir, "messages.db"))
 	if err != nil {
 		return 0, err
@@ -392,12 +413,16 @@ func cmdDaemon(ctx context.Context) error {
 			} else {
 				_ = st.SetMeta("last_sync", time.Now().Format(time.RFC3339))
 			}
+			wait := 6 * time.Hour
+			if err != nil {
+				wait = 10 * time.Minute
+			}
 			select {
 			case c.NewMessages <- struct{}{}:
 			default:
 			}
 			select {
-			case <-time.After(6 * time.Hour):
+			case <-time.After(wait):
 			case <-ctx.Done():
 				return
 			}
@@ -406,7 +431,13 @@ func cmdDaemon(ctx context.Context) error {
 
 	pushFails := 0
 	push := func() {
-		n, err := p.Push(ctx, st, 0)
+		pctx := ctx
+		if ctx.Err() != nil {
+			pctx = context.Background() // shutting down: flush with a fresh context
+		}
+		pctx, cancel := context.WithTimeout(pctx, 2*time.Minute)
+		defer cancel()
+		n, err := p.Push(pctx, st, 0)
 		if err != nil {
 			pushFails++
 			c.Log.Warn().Err(err).Int("consecutive", pushFails).Msg("push failed")

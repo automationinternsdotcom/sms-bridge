@@ -13,6 +13,9 @@ esc() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
 sed -e "s|__LABEL__|$(esc "$LABEL")|" -e "s|__BIN__|$(esc "$BIN")|" -e "s|__DATA__|$(esc "$DATA")|g" \
   "$ROOT/launchd/smsbridge.plist.template" > "$DST"
 plutil -lint "$DST" >/dev/null
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  for _ in $(seq 1 30); do launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break; sleep 1; done
+fi
 launchctl bootstrap "gui/$(id -u)" "$DST"
 launchctl print "gui/$(id -u)/$LABEL" | grep -E "^\s*state =" | head -1

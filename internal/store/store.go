@@ -140,7 +140,7 @@ func (s *Store) Upsert(m *Message) (isNew bool, err error) {
 	key := m.PairingID + "|" + m.MessageID
 	// Same message seen under any pairing (e.g. after a re-pair): reuse its row.
 	var existingKey string
-	err = s.DB.QueryRow(`SELECT row_key FROM messages WHERE message_id=? AND conv_id=? AND ABS(ts_us-?)<=2000000 LIMIT 1`,
+	err = s.DB.QueryRow(`SELECT row_key FROM messages WHERE message_id=? AND conv_id=? AND ABS(ts_us-?)<=600000000 LIMIT 1`,
 		m.MessageID, m.ConvID, m.TsUS).Scan(&existingKey)
 	switch {
 	case err == nil:
@@ -166,13 +166,18 @@ func (s *Store) Upsert(m *Message) (isNew bool, err error) {
 	if n, _ := res.RowsAffected(); n == 1 {
 		return true, nil
 	}
-	// Existing row: refresh mutable fields. Keep the body if the update is empty.
+	// Already in the Sheet: only track status (content may have been scrubbed).
+	if _, err = s.DB.Exec(`UPDATE messages SET status=?, status_name=?, updated_at=? WHERE row_key=? AND pushed_at IS NOT NULL AND status<>?`,
+		m.Status, m.StatusName, now, key, m.Status); err != nil {
+		return false, err
+	}
+	// Not yet pushed: refresh mutable fields. Keep the body if the update is empty.
 	_, err = s.DB.Exec(`UPDATE messages SET status=?, status_name=?, raw=?, updated_at=?,
 		body=CASE WHEN ?<>'' THEN ? ELSE body END,
 		attachments=CASE WHEN ?<>'' THEN ? ELSE attachments END,
 		sender_name=CASE WHEN ?<>'' THEN ? ELSE sender_name END,
 		sender_number=CASE WHEN ?<>'' THEN ? ELSE sender_number END
-		WHERE row_key=? AND (status<>? OR body<>? OR attachments<>?)`,
+		WHERE row_key=? AND pushed_at IS NULL AND (status<>? OR body<>? OR attachments<>?)`,
 		m.Status, m.StatusName, m.Raw, now, m.Body, m.Body, m.Attachments, m.Attachments,
 		m.SenderName, m.SenderName, m.SenderNumber, m.SenderNumber, key, m.Status, m.Body, m.Attachments)
 	return false, err
@@ -185,9 +190,9 @@ func (s *Store) Known(convID, messageID string) bool {
 }
 
 type Row struct {
-	RowKey                                          string
-	TsUS                                            int64
-	Direction, Contact, Number, ConvName, Kind      string
+	RowKey                                           string
+	TsUS                                             int64
+	Direction, Contact, Number, ConvName, Kind       string
 	Body, Attachments, StatusName, ConvID, MessageID string
 }
 
@@ -199,6 +204,7 @@ func (s *Store) PushCandidates(minAge time.Duration, limit int) ([]Row, error) {
 		FROM messages m LEFT JOIN conversations c ON c.conv_id=m.conv_id
 		WHERE m.pushed_at IS NULL AND m.direction IN ('in','out') AND m.ts_us <= ?
 		AND (m.body<>'' OR m.attachments<>'' OR m.first_seen < strftime('%s','now')-600) -- let MMS content arrive
+		AND NOT (m.status IN (101,102,103,104,105,115) AND m.first_seen > strftime('%s','now')-86400) -- media still downloading
 		AND m.status NOT IN (3,4,5,6,7,10,16,20)  -- draft, queued, sending, scheduled, validating
 		ORDER BY m.ts_us LIMIT ?`, cutoff, limit)
 	if err != nil {
@@ -222,7 +228,7 @@ func (s *Store) PushCandidates(minAge time.Duration, limit int) ([]Row, error) {
 // that are never pushed. IDs and timestamps stay for dedup and resume.
 func (s *Store) ScrubPushed() (int64, error) {
 	res, err := s.DB.Exec(`UPDATE messages SET body='', attachments='', sender_name='', sender_number='', raw=NULL
-		WHERE (pushed_at IS NOT NULL OR direction='system')
+		WHERE (pushed_at IS NOT NULL OR direction='system' OR first_seen < strftime('%s','now')-7*86400)
 		AND (body<>'' OR attachments<>'' OR sender_name<>'' OR sender_number<>'' OR raw IS NOT NULL)`)
 	if err != nil {
 		return 0, err

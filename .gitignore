@@ -4,6 +4,11 @@ bin/
 *.db
 *.db-*
 session.json
+session.json.tmp
+firefox-profile/
+pair-emoji.txt
+*.sqlite
+*.sqlite-*
 service-account*.json
 config.json
 *.log

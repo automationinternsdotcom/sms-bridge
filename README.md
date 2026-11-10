@@ -15,12 +15,12 @@ On current Android (16/17), apps on the phone can't see your sent RCS or your en
 - `smsbridge daemon` stays connected and stores each live message in local SQLite. It batches new rows into the Sheet after a 3-second debounce.
 - At startup and then every 6 h, it lists every conversation (inbox, archive, spam). It fetches anything missed and continues paging back through history.
 - Rows are deduplicated by Google message ID. A Row Key column in the Sheet guards against double appends.
-- By default, a message's text, attachments, and sender name/number are erased from the local database once it's in the Sheet. Only IDs and timestamps stay, for dedup and resume. Set `"keep_local_text": true` to keep a local copy.
+- By default, a message's text, attachments, and sender name/number are erased from the local database once it's in the Sheet. Message IDs and timestamps stay, for dedup and resume. Drafts and other rows that never reach the Sheet are erased after 7 days. Conversation names and participant numbers stay, because they label new rows. Set `"keep_local_text": true` to keep a local copy of message text.
 - A **Status** tab in the Sheet shows `last_success`, `last_error` and counts. A macOS notification fires on logout, or when Sheet writes keep failing.
 
 ## Setup (macOS)
 
-You need Go 1.26+, Firefox, and the Google Cloud CLI (`gcloud`).
+You need Go 1.27+, Firefox, and the Google Cloud CLI (`gcloud`).
 
 1. **Build:**
 
@@ -46,13 +46,17 @@ You need Go 1.26+, Firefox, and the Google Cloud CLI (`gcloud`).
 
    Tap the emoji it prints on your phone. Afterwards, delete the Firefox profile folder: it holds your Google sign-in.
 
+   To re-pair later, run `pair` again. Stop the daemon first if it's running. Afterwards, `pair` restarts the daemon itself.
+
 4. **Sheet access:**
 
    ```sh
    gcloud auth login --enable-gdrive-access
    ```
 
-   Sign in with the Google account that should own the Sheet. Then create a Sheet in that account. Alternatively, put a service-account key at `service-account.json` and share the Sheet with that account.
+   Sign in with the Google account that should own the Sheet. Then create a Sheet in that account.
+
+   Alternatively, put a service-account key at `~/Library/Application Support/sms-bridge/service-account.json` and share the Sheet with that account. A key there takes precedence over `gcloud`.
 
 5. **Config.** Write `~/Library/Application Support/sms-bridge/config.json`:
 
@@ -62,6 +66,11 @@ You need Go 1.26+, Firefox, and the Google Cloud CLI (`gcloud`).
      "gcloud_account": "<the account you logged in with>"
    }
    ```
+
+   Optional keys:
+   - `gcloud_bin` (default `/opt/homebrew/bin/gcloud`).
+   - `keep_local_text` (default `false`).
+   - `service_account_key` (a path).
 
 6. **Run it always-on:**
 
@@ -79,6 +88,8 @@ Other commands:
 - `smsbridge sync [-backfill-pages N]`: one-off catch-up.
 - `smsbridge push`: push pending rows.
 - `smsbridge run`: a gated one-shot for cron-style use.
+
+These share one session lock with the daemon. While the daemon runs, they refuse to start; it already syncs and pushes on its own.
 
 ## Caveats
 

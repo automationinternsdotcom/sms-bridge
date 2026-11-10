@@ -37,14 +37,18 @@ type Pusher struct {
 type gcloudTokens struct{ gcloud, account string }
 
 func (g gcloudTokens) Token() (*oauth2.Token, error) {
-	out, err := exec.Command(g.gcloud, "auth", "print-access-token", "--account="+g.account).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, g.gcloud, "auth", "print-access-token", "--account="+g.account).Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			return nil, fmt.Errorf("gcloud token for %s: %v: %s", g.account, err, strings.TrimSpace(string(ee.Stderr)))
 		}
 		return nil, fmt.Errorf("gcloud token: %w", err)
 	}
-	return &oauth2.Token{AccessToken: strings.TrimSpace(string(out)), Expiry: time.Now().Add(45 * time.Minute)}, nil
+	// gcloud returns its own cached token, which may be close to expiry, and
+	// refreshes it when needed. Re-ask every 2 minutes rather than trusting age.
+	return &oauth2.Token{AccessToken: strings.TrimSpace(string(out)), Expiry: time.Now().Add(2 * time.Minute)}, nil
 }
 
 // New uses a service-account key when keyFile exists, else the gcloud login of gcloudAccount.

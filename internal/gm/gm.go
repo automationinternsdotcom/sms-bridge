@@ -67,12 +67,12 @@ func (c *Client) SaveSession() error {
 func (c *Client) newClient() {
 	c.active = make(chan struct{}, 1)
 	c.fatal = make(chan error, 1)
-	c.cli = libgm.NewClient(c.sess, nil, c.Log, exhttp.SensibleClientSettings)
+	c.cli = libgm.NewClient(c.sess, nil, c.Log.Level(zerolog.ErrorLevel), exhttp.SensibleClientSettings)
 	c.cli.SetEventHandler(c.handleEvent)
 }
 
-// Pair runs Google-account pairing. onEmoji is called with the emoji Jon must
-// tap on his phone.
+// Pair runs Google-account pairing. onEmoji is called with the emoji the user
+// must tap on their phone.
 func (c *Client) Pair(ctx context.Context, cookies map[string]string, onEmoji func(string)) error {
 	c.sess = libgm.NewAuthData()
 	c.sess.SetCookies(cookies)
@@ -147,7 +147,7 @@ func isCredErr(err error) bool {
 	}
 	var he events.HTTPError
 	if errors.As(err, &he) && he.Resp != nil {
-		return he.Resp.StatusCode == 401 || he.Resp.StatusCode == 403
+		return he.Resp.StatusCode == 401
 	}
 	return false
 }
@@ -197,10 +197,12 @@ func (c *Client) handleEvent(raw any) {
 		case gmproto.AlertType_BROWSER_INACTIVE, gmproto.AlertType_BROWSER_INACTIVE_FROM_TIMEOUT, gmproto.AlertType_BROWSER_INACTIVE_FROM_INACTIVITY:
 			c.Log.Warn().Str("alert", evt.GetAlertType().String()).Msg("this session became inactive (another Messages for Web session took over)")
 		}
-	case events.ListenFatalError:
-		c.signalFatal(fmt.Errorf("%w (%v)", ErrLoggedOut, evt.Error))
 	case *events.ListenFatalError:
-		c.signalFatal(fmt.Errorf("%w (%v)", ErrLoggedOut, evt.Error))
+		if isCredErr(evt.Error) {
+			c.signalFatal(fmt.Errorf("%w (%v)", ErrLoggedOut, evt.Error))
+		} else {
+			c.signalFatal(fmt.Errorf("listen failed: %w", evt.Error))
+		}
 	case *events.GaiaLoggedOut, events.GaiaLoggedOut, *gmproto.RevokePairData:
 		c.signalFatal(ErrLoggedOut)
 	case *events.AuthTokenRefreshed, events.AuthTokenRefreshed:
@@ -254,8 +256,8 @@ func folderName(f gmproto.ListConversationsRequest_Folder) string {
 
 // SyncStats summarises one sync run.
 type SyncStats struct {
-	Conversations, Checked, NewMessages, Pages, LiveEvents int
-	BackfillPending                                       int
+	Conversations, Checked, NewMessages, Pages, LiveEvents, Failed int
+	BackfillPending                                                int
 }
 
 // Sync enumerates every conversation and fetches messages newer than what is
@@ -318,7 +320,12 @@ func (c *Client) Sync(ctx context.Context, maxPagesBackfill int) (*SyncStats, er
 			st.NewMessages += n
 			st.Pages += pages
 			if err != nil {
-				return st, err
+				if errors.Is(err, ErrLoggedOut) || ctx.Err() != nil {
+					return st, err
+				}
+				st.Failed++
+				c.Log.Warn().Err(err).Str("conv", sc.ConvID).Msg("conversation head sync failed; skipping")
+				continue
 			}
 			if err := c.Store.SetSyncedTo(sc.ConvID, conv.GetLastMessageTimestamp()); err != nil {
 				return st, err
@@ -352,7 +359,11 @@ func (c *Client) Sync(ctx context.Context, maxPagesBackfill int) (*SyncStats, er
 		st.NewMessages += n
 		st.Pages += pages
 		if err != nil {
-			return st, err
+			if errors.Is(err, ErrLoggedOut) || ctx.Err() != nil {
+				return st, err
+			}
+			st.Failed++
+			c.Log.Warn().Err(err).Str("conv", sc.ConvID).Msg("conversation backfill failed; skipping")
 		}
 	}
 	c.mu.Lock()
@@ -361,6 +372,9 @@ func (c *Client) Sync(ctx context.Context, maxPagesBackfill int) (*SyncStats, er
 	s, _ := c.Store.Stats()
 	if s != nil {
 		st.BackfillPending = s.BackfillPending
+	}
+	if st.Failed > 0 {
+		return st, fmt.Errorf("%d conversation(s) failed to sync; will retry", st.Failed)
 	}
 	return st, nil
 }
@@ -415,7 +429,15 @@ func (c *Client) syncHead(ctx context.Context, pairing string, sc *store.Convers
 			}
 		}
 		oldest = nextCursor(resp, msgs)
-		if known == len(msgs) || oldest == nil {
+		minTS := msgs[0].GetTimestamp()
+		for _, m := range msgs {
+			if m.GetTimestamp() < minTS {
+				minTS = m.GetTimestamp()
+			}
+		}
+		// A fully known page only ends the pass once it reaches what was already
+		// synced; live-stored messages above a gap must not hide the gap.
+		if oldest == nil || (known == len(msgs) && minTS <= sc.SyncedToUS) {
 			return newMsgs, pages, oldest, nil
 		}
 		// New conversation: take only the newest page here; older history is

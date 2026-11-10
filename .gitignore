@@ -1,0 +1,13 @@
+# build output
+bin/
+# local data and secrets (normally live in ~/Library/Application Support/sms-bridge)
+*.db
+*.db-*
+session.json
+service-account*.json
+config.json
+*.log
+# personal working notes / research
+GOALS.md
+brainstew/
+.DS_Store

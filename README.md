@@ -2,4 +2,91 @@
 
 # sms-bridge
 
-Created in [T3 Code](https://t3.codes).
+Copy every text from your Android phone into a Google Sheet within seconds. That covers SMS, MMS and RCS, including sent and end-to-end-encrypted RCS.
+
+It runs on a Mac as an extra **Google Messages for Web** device, using [mautrix-gmessages](https://github.com/mautrix/gmessages)' `libgm`. That makes it a reverse-engineered, unofficial protocol: it can break whenever Google changes something.
+
+## Why this approach
+
+On current Android (16/17), apps on the phone can't see your sent RCS or your encrypted RCS. Google Messages no longer writes sent RCS to the shared database, and it marks encrypted RCS as restricted. Messages for Web does receive them. `libgm` pairs as a **tablet**, which runs alongside your normal messages.google.com tab, so you can keep using the browser.
+
+## How it works
+
+- `smsbridge daemon` stays connected and stores each live message in local SQLite. It batches new rows into the Sheet after a 3-second debounce.
+- At startup and then every 6 h, it lists every conversation (inbox, archive, spam). It fetches anything missed and continues paging back through history.
+- Rows are deduplicated by Google message ID. A Row Key column in the Sheet guards against double appends.
+- By default, a message's text, attachments, and sender name/number are erased from the local database once it's in the Sheet. Only IDs and timestamps stay, for dedup and resume. Set `"keep_local_text": true` to keep a local copy.
+- A **Status** tab in the Sheet shows `last_success`, `last_error` and counts. A macOS notification fires on logout, or when Sheet writes keep failing.
+
+## Setup (macOS)
+
+You need Go 1.26+, Firefox, and the Google Cloud CLI (`gcloud`).
+
+1. **Build:**
+
+   ```sh
+   go build -o bin/smsbridge ./cmd/smsbridge
+   ```
+
+2. **Get a Google sign-in for pairing.** Use Firefox, because Chrome's device-bound session cookies break copied cookies.
+
+   ```sh
+   /Applications/Firefox.app/Contents/MacOS/firefox \
+     -profile "$HOME/Library/Application Support/sms-bridge/firefox-profile" \
+     -no-remote https://messages.google.com/web/authentication
+   ```
+
+   Sign in with the Google account your phone's Google Messages uses, then quit Firefox.
+
+3. **Pair:**
+
+   ```sh
+   ./bin/smsbridge pair
+   ```
+
+   Tap the emoji it prints on your phone. Afterwards, delete the Firefox profile folder: it holds your Google sign-in.
+
+4. **Sheet access:**
+
+   ```sh
+   gcloud auth login --enable-gdrive-access
+   ```
+
+   Sign in with the Google account that should own the Sheet. Then create a Sheet in that account. Alternatively, put a service-account key at `service-account.json` and share the Sheet with that account.
+
+5. **Config.** Write `~/Library/Application Support/sms-bridge/config.json`:
+
+   ```json
+   {
+     "spreadsheet_id": "<id from the Sheet URL>",
+     "gcloud_account": "<the account you logged in with>"
+   }
+   ```
+
+6. **Run it always-on:**
+
+   ```sh
+   ./scripts/install-launchd.sh
+   ```
+
+7. **Check it:**
+
+   ```sh
+   ./bin/smsbridge status
+   ```
+
+Other commands:
+- `smsbridge sync [-backfill-pages N]`: one-off catch-up.
+- `smsbridge push`: push pending rows.
+- `smsbridge run`: a gated one-shot for cron-style use.
+
+## Caveats
+
+- `session.json` in the data folder is equivalent to access to your Google account. Keep the folder `0700`, and consider turning on FileVault.
+- The LaunchAgent only runs while your macOS user is logged in.
+- Rows are append-only. Later edits and deletions on the phone aren't reflected in the Sheet.
+- Google may unpair inactive devices or log the session out. Re-run `pair` when notified.
+
+## License
+
+AGPL-3.0, because `libgm` is AGPL-3.0. See [LICENSE](LICENSE).

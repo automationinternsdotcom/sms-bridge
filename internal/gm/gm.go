@@ -302,6 +302,7 @@ func (c *Client) Sync(ctx context.Context, maxPagesBackfill int) (*SyncStats, er
 	st.Conversations = len(convs)
 
 	backfillBudget := maxPagesBackfill
+	headFailed := map[string]bool{}
 	for _, conv := range convs {
 		if err := ctx.Err(); err != nil {
 			return st, err
@@ -324,6 +325,7 @@ func (c *Client) Sync(ctx context.Context, maxPagesBackfill int) (*SyncStats, er
 					return st, err
 				}
 				st.Failed++
+				headFailed[sc.ConvID] = true
 				c.Log.Warn().Err(err).Str("conv", sc.ConvID).Msg("conversation head sync failed; skipping")
 				continue
 			}
@@ -352,8 +354,8 @@ func (c *Client) Sync(ctx context.Context, maxPagesBackfill int) (*SyncStats, er
 		if err != nil {
 			return st, err
 		}
-		if sc.BackfillDone {
-			continue
+		if sc.BackfillDone || headFailed[sc.ConvID] {
+			continue // a failed head must be retried before backfill, or the gap could be sealed
 		}
 		n, pages, err := c.backfill(ctx, pairing, sc, &backfillBudget, maxPagesBackfill == 0)
 		st.NewMessages += n
@@ -400,7 +402,8 @@ func (c *Client) saveConversation(conv *gmproto.Conversation, folder string) err
 
 const pageSize = 50
 
-// syncHead pages from newest backwards until a full page is already known.
+// syncHead pages from newest backwards until it reaches already-synced history
+// (a fully known page at or below the conversation's watermark).
 func (c *Client) syncHead(ctx context.Context, pairing string, sc *store.Conversation) (newMsgs, pages int, oldest *gmproto.Cursor, err error) {
 	var cursor *gmproto.Cursor
 	for pages < 1000 {

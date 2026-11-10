@@ -46,7 +46,7 @@ You need Go 1.27+, Firefox, and the Google Cloud CLI (`gcloud`).
 
    Tap the emoji it prints on your phone. Afterwards, delete the Firefox profile folder: it holds your Google sign-in.
 
-   To re-pair later, run `pair` again. Stop the daemon first if it's running. Afterwards, `pair` restarts the daemon itself.
+   To re-pair later, stop the daemon if it's running, then run `pair` again. Afterwards, start the daemon with `./scripts/install-launchd.sh` (`pair` restarts it itself if it's still loaded).
 
 4. **Sheet access:**
 

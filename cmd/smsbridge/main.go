@@ -138,7 +138,7 @@ func cmdPair(ctx context.Context, args []string) error {
 	fmt.Printf("Found %d Google cookies. Starting pairing...\n", len(ck))
 	lock, err := syncLock()
 	if err != nil {
-		return fmt.Errorf("%w: stop the daemon first (launchctl bootout gui/$(id -u)/%s)", err, launchLabel())
+		return fmt.Errorf("%w: stop the daemon first (launchctl bootout gui/$(id -u)/%s), then re-run pair; afterwards start it with ./scripts/install-launchd.sh", err, launchLabel())
 	}
 	defer lock.Close()
 	st, c, err := openAll(true)
@@ -161,6 +161,8 @@ func cmdPair(ctx context.Context, args []string) error {
 	lock.Close()
 	if exec.Command("launchctl", "kickstart", "-k", fmt.Sprintf("gui/%d/%s", os.Getuid(), launchLabel())).Run() == nil {
 		fmt.Println("Restarted the background daemon.")
+	} else {
+		fmt.Printf("Note: the background daemon (%s) is not loaded. Start it with ./scripts/install-launchd.sh\n", launchLabel())
 	}
 	return nil
 }
@@ -465,7 +467,9 @@ func cmdDaemon(ctx context.Context) error {
 		if s == nil {
 			return
 		}
-		_ = p.WriteStatus(ctx, [][2]string{
+		wctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		_ = p.WriteStatus(wctx, [][2]string{
 			{"mode", "always-on (live)"},
 			{"last_success", st.GetMeta("last_success")},
 			{"last_sync", st.GetMeta("last_sync")},

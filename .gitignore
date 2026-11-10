@@ -1,0 +1,18 @@
+# build output
+bin/
+# local data and secrets (normally live in ~/Library/Application Support/sms-bridge)
+*.db
+*.db-*
+session.json
+session.json.tmp
+firefox-profile/
+pair-emoji.txt
+*.sqlite
+*.sqlite-*
+service-account*.json
+config.json
+*.log
+# personal working notes / research
+GOALS.md
+brainstew/
+.DS_Store

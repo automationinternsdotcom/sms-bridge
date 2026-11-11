@@ -38,6 +38,10 @@ type Client struct {
 	fatal  chan error
 	live   int
 	saveMu sync.Mutex
+
+	stallHint chan struct{}
+	sims      map[string]*gmproto.SIMCard
+	pending   map[string]chan *gmproto.Message
 }
 
 func (c *Client) loadSession() error {
@@ -67,8 +71,12 @@ func (c *Client) SaveSession() error {
 func (c *Client) newClient() {
 	c.active = make(chan struct{}, 1)
 	c.fatal = make(chan error, 1)
-	c.cli = libgm.NewClient(c.sess, nil, c.Log.Level(zerolog.ErrorLevel), exhttp.SensibleClientSettings)
+	if c.stallHint == nil {
+		c.stallHint = make(chan struct{}, 1)
+	}
+	c.cli = libgm.NewClient(c.sess, nil, c.Log.Level(zerolog.WarnLevel), exhttp.SensibleClientSettings)
 	c.cli.SetEventHandler(c.handleEvent)
+	c.cli.SetDataReceiveCheckInterval(15 * time.Minute)
 }
 
 // Pair runs Google-account pairing. onEmoji is called with the emoji the user
@@ -158,6 +166,7 @@ func (c *Client) handleEvent(raw any) {
 		c.mu.Lock()
 		c.live++
 		c.mu.Unlock()
+		c.handleEcho(evt.Message)
 		if conv, _ := c.Store.GetConversation(evt.GetConversationID()); conv != nil {
 			if _, err := c.storeMessage(evt.Message, conv); err != nil {
 				c.Log.Err(err).Msg("store live message")
@@ -183,6 +192,8 @@ func (c *Client) handleEvent(raw any) {
 				}
 			}()
 		}
+	case *gmproto.Settings:
+		c.handleSettings(evt)
 	case *gmproto.Conversation:
 		if sc, _ := c.Store.GetConversation(evt.GetConversationID()); sc != nil {
 			_ = c.saveConversation(evt, sc.Folder)
@@ -196,6 +207,12 @@ func (c *Client) handleEvent(raw any) {
 			}
 		case gmproto.AlertType_BROWSER_INACTIVE, gmproto.AlertType_BROWSER_INACTIVE_FROM_TIMEOUT, gmproto.AlertType_BROWSER_INACTIVE_FROM_INACTIVITY:
 			c.Log.Warn().Str("alert", evt.GetAlertType().String()).Msg("this session became inactive (another Messages for Web session took over)")
+		default:
+			// Push-throttle and other alerts explain silent stalls; log them all.
+			c.Log.Warn().Str("alert", evt.GetAlertType().String()).Msg("phone alert")
+			if strings.Contains(evt.GetAlertType().String(), "THROTTLE_ENDED") {
+				c.hintStall()
+			}
 		}
 	case *events.ListenFatalError:
 		if isCredErr(evt.Error) {
@@ -207,6 +224,12 @@ func (c *Client) handleEvent(raw any) {
 		c.signalFatal(ErrLoggedOut)
 	case *events.AuthTokenRefreshed, events.AuthTokenRefreshed:
 		_ = c.SaveSession()
+	case *events.NoDataReceived, events.NoDataReceived:
+		c.Log.Warn().Msg("libgm: no data received recently")
+		c.hintStall()
+	case *events.HackySetActiveMayFail, events.HackySetActiveMayFail:
+		c.Log.Warn().Msg("libgm: setting this session active may have failed")
+		c.hintStall()
 	case *events.PhoneNotResponding, events.PhoneNotResponding:
 		c.Log.Warn().Msg("phone not responding (is it online?)")
 	}
@@ -614,4 +637,69 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// QuickSync checks the most recently active inbox conversations for messages
+// the live stream missed (it can go silent without any error). It returns how
+// many new messages it stored.
+func (c *Client) QuickSync(ctx context.Context) (int, error) {
+	resp, err := c.cli.ListConversations(ctx, &gmproto.ListConversationsRequest{Count: 25, Folder: gmproto.ListConversationsRequest_INBOX})
+	if err != nil {
+		if isCredErr(err) {
+			return 0, fmt.Errorf("%w (%v)", ErrLoggedOut, err)
+		}
+		return 0, err
+	}
+	pairing := c.PairingID()
+	total := 0
+	for _, conv := range resp.GetConversations() {
+		sc, err := c.Store.GetConversation(conv.GetConversationID())
+		if err != nil {
+			return total, err
+		}
+		if sc != nil && conv.GetLastMessageTimestamp() <= sc.SyncedToUS {
+			continue
+		}
+		folder := "inbox"
+		if sc != nil {
+			folder = sc.Folder
+		}
+		if err := c.saveConversation(conv, folder); err != nil {
+			return total, err
+		}
+		if sc, err = c.Store.GetConversation(conv.GetConversationID()); err != nil || sc == nil {
+			return total, err
+		}
+		n, _, oldest, err := c.syncHead(ctx, pairing, sc)
+		total += n
+		if err != nil {
+			if errors.Is(err, ErrLoggedOut) || ctx.Err() != nil {
+				return total, err
+			}
+			c.Log.Warn().Err(err).Str("conv", sc.ConvID).Msg("quick sync head failed")
+			continue
+		}
+		_ = c.Store.SetSyncedTo(sc.ConvID, conv.GetLastMessageTimestamp())
+		if !sc.BackfillDone && sc.BackfillCursorID == "" && oldest != nil {
+			_ = c.Store.SetBackfill(sc.ConvID, false, oldest.LastItemID, oldest.LastItemTimestamp, 0)
+		}
+	}
+	return total, nil
+}
+
+// ReArm asks the phone to resume pushing events to this session (GET_UPDATES).
+// The push subscription can go stale while the connection still looks healthy.
+func (c *Client) ReArm(ctx context.Context) error { return c.cli.SetActiveSession(ctx) }
+
+// Reconnect drops and re-establishes the long poll with a new listener session.
+func (c *Client) Reconnect(ctx context.Context) error { return c.cli.Reconnect(ctx) }
+
+// StallHints fires when libgm reports no data received recently.
+func (c *Client) StallHints() <-chan struct{} { return c.stallHint }
+
+func (c *Client) hintStall() {
+	select {
+	case c.stallHint <- struct{}{}:
+	default:
+	}
 }

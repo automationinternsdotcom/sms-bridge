@@ -91,6 +91,32 @@ Other commands:
 
 These share one session lock with the daemon. While the daemon runs, they refuse to start; it already syncs and pushes on its own.
 
+## Sending texts
+
+Only the daemon is connected to your phone, so sends go through it over a Unix socket (`send.sock`, mode 0600) in the data folder.
+
+```sh
+smsbridge lookup "Alex"                             # find conversations by name or number (JSON)
+printf '%s' "Running 5 min late" | smsbridge send -conv ID
+smsbridge send -to +15550100123 -text "hi"          # by number
+smsbridge send -conv ID -attach /abs/path/pic.png -text "caption"
+smsbridge send -conv ID -dry-run                    # show the recipient without sending
+```
+
+`send` prints one JSON line and its exit code tells you what happened:
+
+| exit | meaning |
+|---|---|
+| 0 | `sent` |
+| 1 | `failed` (definitely not sent) |
+| 3 | `unknown`: the phone accepted it but hasn't confirmed. Don't retry, or it may go out twice. |
+
+Group conversations need `-allow-group`.
+
+RCS chats drop an image sent with a caption as one message, so for RCS the image goes first and the caption follows as its own message.
+
+The daemon also checks recent conversations every 2 minutes. If it finds messages the live stream missed, it re-arms the phone's push subscription, and it reconnects if the gap persists.
+
 ## Caveats
 
 - `session.json` in the data folder is equivalent to access to your Google account. Keep the folder `0700`, and consider turning on FileVault.

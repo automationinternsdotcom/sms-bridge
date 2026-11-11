@@ -299,3 +299,27 @@ func abs(x int64) int64 {
 	}
 	return x
 }
+
+// FindConversations returns conversations whose name or participants contain
+// any of the given terms (case-insensitive), most recently active first.
+func (s *Store) FindConversations(term string, limit int) ([]*Conversation, error) {
+	like := "%" + term + "%"
+	rows, err := s.DB.Query(`SELECT conv_id,name,conv_type,is_group,folder,participants,last_msg_us FROM conversations
+		WHERE name LIKE ? COLLATE NOCASE OR participants LIKE ? COLLATE NOCASE
+		ORDER BY last_msg_us DESC LIMIT ?`, like, like, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Conversation
+	for rows.Next() {
+		c := &Conversation{}
+		var isGroup int
+		if err := rows.Scan(&c.ConvID, &c.Name, &c.ConvType, &isGroup, &c.Folder, &c.Participants, &c.LastMsgUS); err != nil {
+			return nil, err
+		}
+		c.IsGroup = isGroup == 1
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}

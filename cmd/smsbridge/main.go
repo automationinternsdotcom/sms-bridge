@@ -7,6 +7,8 @@
 //	smsbridge push                        append unpushed messages to the Sheet
 //	smsbridge run [-force]                scheduled entry point: sync+push when 10h have passed
 //	smsbridge status                      show counts and last run
+//	smsbridge lookup NAME-OR-NUMBER       find conversations to send to
+//	smsbridge send -to PHONE|-conv ID     send a text (body on stdin or -text) via the daemon
 package main
 
 import (
@@ -21,6 +23,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -69,6 +72,10 @@ func main() {
 		err = cmdDaemon(ctx)
 	case "status":
 		err = cmdStatus()
+	case "send":
+		err = cmdSend(os.Args[2:])
+	case "lookup":
+		err = cmdLookup(os.Args[2:])
 	default:
 		usage()
 	}
@@ -78,7 +85,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: smsbridge pair|sync|push|run|daemon|status")
+	fmt.Fprintln(os.Stderr, "usage: smsbridge pair|sync|push|run|daemon|status|lookup|send")
 	os.Exit(2)
 }
 
@@ -391,6 +398,9 @@ func cmdDaemon(ctx context.Context) error {
 	_ = st.SetMeta("account_email", c.Email())
 	_ = st.SetMeta("daemon_started", time.Now().Format(time.RFC3339))
 	c.Log.Info().Msg("daemon connected")
+	if err := serveSend(ctx, c); err != nil {
+		c.Log.Warn().Err(err).Msg("send socket unavailable; sending disabled")
+	}
 
 	p, err := sheets.New(ctx, cfg.KeyFile, cfg.GcloudBin, cfg.GcloudAccount, cfg.SpreadsheetID)
 	if err != nil {
@@ -399,6 +409,7 @@ func cmdDaemon(ctx context.Context) error {
 
 	// Background reconciliation + backfill: immediately, then every 6 hours.
 	syncDone := make(chan error, 1)
+	var reconciled atomic.Bool // gaps found before the first reconcile are just downtime backlog
 	go func() {
 		for {
 			stats, err := c.Sync(ctx, 0)
@@ -415,6 +426,7 @@ func cmdDaemon(ctx context.Context) error {
 			} else {
 				_ = st.SetMeta("last_sync", time.Now().Format(time.RFC3339))
 			}
+			reconciled.Store(true)
 			wait := 6 * time.Hour
 			if err != nil {
 				wait = 10 * time.Minute
@@ -487,6 +499,51 @@ func cmdDaemon(ctx context.Context) error {
 	safety := time.NewTicker(2 * time.Minute) // catches rows that missed a signal
 	statusTick := time.NewTicker(5 * time.Minute)
 	saveTick := time.NewTicker(10 * time.Minute)
+	quickTick := time.NewTicker(2 * time.Minute) // catches messages the live stream missed
+	defer quickTick.Stop()
+	// quickCheck syncs recent conversations. Finding messages the live stream
+	// missed means the phone's push subscription went stale: re-arm it, and
+	// reconnect if the next check still finds a gap (mirrors the mautrix
+	// bridge's receive-stall recovery). Returns true if the daemon should exit.
+	gaps := 0
+	quickCheck := func() bool {
+		qctx, qcancel := context.WithTimeout(ctx, 90*time.Second)
+		defer qcancel()
+		n, err := c.QuickSync(qctx)
+		if err != nil {
+			if errors.Is(err, gm.ErrLoggedOut) {
+				_ = st.SetMeta("last_error", time.Now().Format(time.RFC3339)+" "+err.Error())
+				writeStatus()
+				notify("SMS bridge logged out: run `smsbridge pair` again")
+				return true
+			}
+			c.Log.Warn().Err(err).Msg("quick sync failed")
+			return false
+		}
+		if n == 0 || !reconciled.Load() {
+			gaps = 0
+			if n > 0 {
+				debounce.Reset(time.Second)
+			}
+			return false
+		}
+		gaps++
+		_ = st.SetMeta("last_live_gap", time.Now().Format(time.RFC3339))
+		debounce.Reset(time.Second)
+		if gaps == 1 {
+			c.Log.Warn().Int("messages", n).Msg("live stream missed messages; re-arming phone push subscription")
+			if err := c.ReArm(qctx); err != nil {
+				c.Log.Warn().Err(err).Msg("re-arm failed")
+			}
+		} else {
+			c.Log.Warn().Int("messages", n).Int("consecutive", gaps).Msg("live stream still missing messages; reconnecting")
+			if err := c.Reconnect(ctx); err != nil {
+				c.Log.Warn().Err(err).Msg("reconnect failed")
+			}
+			gaps = 0
+		}
+		return false
+	}
 	defer safety.Stop()
 	defer statusTick.Stop()
 	defer saveTick.Stop()
@@ -505,6 +562,14 @@ func cmdDaemon(ctx context.Context) error {
 			writeStatus()
 		case <-saveTick.C:
 			_ = c.SaveSession()
+		case <-quickTick.C:
+			if quickCheck() {
+				return nil
+			}
+		case <-c.StallHints():
+			if quickCheck() {
+				return nil
+			}
 		case err := <-syncDone:
 			if errors.Is(err, gm.ErrLoggedOut) {
 				_ = st.SetMeta("last_error", time.Now().Format(time.RFC3339)+" "+err.Error())
